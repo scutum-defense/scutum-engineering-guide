@@ -279,3 +279,77 @@ interface DetectionTestCase {
 - Detection rules include false positive guidance to reduce operator fatigue
 - Detection rules reference MITRE ATT&CK techniques for standardized classification
 - Detection rule performance (execution time, resource consumption) must be benchmarked before deployment
+
+---
+
+## Event-Time Correctness Pattern
+
+**Principle:** Detection and correlation logic must operate on event time (the timestamp embedded in the event by its source), never on wall-clock time at the point of processing. Wall-clock time introduces skew that silently corrupts rate windows, cooldowns, and ordering guarantees.
+
+### Rules
+
+- Matchers, windows, and suppressors derive all temporal comparisons from `event.timestamp`, not `Date.now()`
+- Late-arriving events carry their original event time; allowed lateness is an explicit configuration value, not an accident of queue depth
+- Ordering is established by `(eventTimestamp, sequenceNumber)`, never by arrival order
+- Any component that must use processing time (e.g., a cooldown reset) declares it explicitly and tests for skew tolerance
+
+### Anti-pattern
+
+```ts
+// WRONG: a slow consumer turns a 1-minute rate window into an arbitrary window.
+const recent = events.filter((e) => Date.now() - e.receivedAt < 60_000);
+
+// RIGHT: window membership is a property of the event, not the pipeline.
+const recent = events.filter((e) => event.timestamp - e.timestamp < 60_000);
+```
+
+---
+
+## Deterministic Simulation Pattern
+
+**Principle:** Any component that estimates risk, predicts outcomes, or compares courses of action must produce reproducible results for a given input. Non-determinism in decision support is an audit failure: operators cannot review why the system recommended an action if the recommendation cannot be replayed.
+
+### Rules
+
+- Stochastic components (Monte Carlo trials, sampling) accept an explicit seed; the seed is recorded in the audit chain with the recommendation it produced
+- Seeds, input snapshots, and version identifiers together form the replay key: same key → identical recommendation, bit for bit
+- Statistical summaries expose distribution shape (percentiles), not just means — a mean risk delta hides fat-tail exposure
+- Outcome comparisons use relative deltas with explicit thresholds; a 2-point drop means nothing without the baseline
+
+---
+
+## Hash-Complete Tamper Evidence Pattern
+
+**Principle:** A tamper-evident chain is only as strong as its hash input. Every field that an auditor would treat as material to the record — identifiers, labels, targets, payloads — must participate in the digest. Any excluded field is a silent forgery vector.
+
+### Rules
+
+- The hash input is a canonical serialization: sorted keys, deterministic encoding, no ambient locale or number formatting
+- Adding a field to the record type forces a decision: hash it or explicitly declare it non-material (and document why)
+- Verification recomputes the digest from the canonical form, never trusts a stored digest for a re-serialized record
+- Chain breaks are reported with the sequence number and expected vs. actual previous hash, so an operator can localize the tamper
+
+### Anti-pattern
+
+```ts
+// WRONG: actor and target are display-only... until someone edits one.
+const digest = sha256(`${entry.id}:${entry.timestamp}:${entry.prevHash}`);
+
+// RIGHT: every material field participates, via canonical JSON.
+const digest = sha256(
+  `${entry.id}:${entry.seq}:${entry.timestamp}:${entry.actor}:${canonicalize(entry)}`
+);
+```
+
+---
+
+## Redaction at the Boundary Pattern
+
+**Principle:** Redaction must occur where data enters a system (or a log record), not at the point of display. Any log field that bypasses the redaction pipeline — a context object, a nested argument, a "safe" structured value — is a leak.
+
+### Rules
+
+- All structured log fields pass through the same redaction guards; no field is exempt by convention
+- Redaction matches both key semantics (`Authorization`, `id_token`) and value shape (JWT structure, card number checksum ranges, PEM blocks) — key filtering alone misses smuggled values
+- Redaction is idempotent and shape-preserving: a redacted record re-logged produces no new exposure
+- Tests assert that known-sensitive fixtures (real-format JWTs, keys, cards) never appear in output, for every log level
